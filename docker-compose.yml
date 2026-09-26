@@ -1,0 +1,41 @@
+services:
+  web:
+    build: .
+    image: valve-bank-switch:latest
+    ports:
+      # Both host and container ports are configurable:
+      #   WEB_PORT=9090 PORT=80 docker compose up web
+      - "${WEB_PORT:-8080}:${PORT:-8080}"
+    environment:
+      PORT: "${PORT:-8080}"
+      VALVE_DB_DIR: /data
+      # Enables the failure-injection/reset hooks used by the verify service
+      # and the smoke tests. Drop this in a real deployment.
+      VALVE_ALLOW_RESET: "1"
+    volumes:
+      - valve-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os,urllib.request,sys; port=os.environ.get('PORT','8080'); sys.exit(0 if urllib.request.urlopen(f'http://127.0.0.1:{port}/health', timeout=3).status == 200 else 1)"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
+    restart: unless-stopped
+
+  # One-shot verification: code tests (reverse-order compensation and
+  # post-restart receipt recognition), build checks and HTTP smoke against
+  # the running web service. Finishes and reports its exit code:
+  #   docker compose build && docker compose run --rm verify
+  verify:
+    image: valve-bank-switch:latest
+    build: .
+    command: ["python", "scripts/verify.py"]
+    environment:
+      WEB_URL: "http://web:${PORT:-8080}"
+      VALVE_ALLOW_RESET: "1"
+    depends_on:
+      web:
+        condition: service_healthy
+
+volumes:
+  valve-data:

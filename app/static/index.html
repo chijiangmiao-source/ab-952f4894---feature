@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>束线真空阀组切换控制台</title>
+<style>
+  :root {
+    --bg:#0f1420; --panel:#182032; --line:#2a3550; --text:#e6ecf7;
+    --muted:#8b97b0; --accent:#4f8cff; --ok:#34c77b; --warn:#f5a524;
+    --err:#f2545b; --skip:#7a8699;
+  }
+  * { box-sizing:border-box; }
+  body {
+    margin:0; font:14px/1.5 -apple-system,"Segoe UI",Roboto,"PingFang SC",
+          "Microsoft YaHei",sans-serif;
+    background:var(--bg); color:var(--text);
+  }
+  header { padding:20px 28px; border-bottom:1px solid var(--line); }
+  header h1 { margin:0; font-size:18px; }
+  header p { margin:4px 0 0; color:var(--muted); font-size:12px; }
+  main { max-width:1040px; margin:24px auto; padding:0 20px; }
+  .panel {
+    background:var(--panel); border:1px solid var(--line);
+    border-radius:10px; padding:20px; margin-bottom:20px;
+  }
+  .panel h2 { margin:0 0 14px; font-size:15px; }
+  label { display:block; font-size:12px; color:var(--muted); margin-bottom:4px; }
+  input[type=text], input[type=number] {
+    width:100%; background:#0d1322; border:1px solid var(--line);
+    color:var(--text); border-radius:6px; padding:8px 10px; font-size:14px;
+  }
+  input:focus { outline:none; border-color:var(--accent); }
+  .row { display:grid; grid-template-columns: 2fr 1fr 1fr auto; gap:10px;
+         align-items:end; margin-bottom:8px; }
+  .op-row { display:grid; grid-template-columns: 1fr auto; gap:10px;
+            align-items:end; margin-bottom:16px; }
+  button {
+    background:var(--accent); color:#fff; border:0; border-radius:6px;
+    padding:9px 16px; font-size:14px; cursor:pointer;
+  }
+  button.secondary { background:#2a3550; }
+  button.danger { background:#3a2430; color:#ff9ea3; }
+  button:disabled { opacity:.5; cursor:not-allowed; }
+  .toolbar { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
+  table { width:100%; border-collapse:collapse; margin-top:8px; }
+  th, td { text-align:left; padding:9px 10px; border-bottom:1px solid var(--line);
+           font-size:13px; }
+  th { color:var(--muted); font-weight:600; }
+  .badge { display:inline-block; padding:2px 10px; border-radius:999px;
+           font-size:12px; font-weight:600; }
+  .b-PENDING      { background:#2a3550; color:#aebbd6; }
+  .b-EXECUTING    { background:#1d3a66; color:#8fc0ff; }
+  .b-COMPENSATING { background:#4a3512; color:#f5c56b; }
+  .b-COMPLETED    { background:#14402b; color:#6ee7a8; }
+  .b-COMPENSATED  { background:#3d3310; color:#e8cf7a; }
+  .b-COMPENSATION_FAILED { background:#4a1d22; color:#ff9ea3; }
+  .s-SUCCESS { color:var(--ok); }
+  .s-FAILED  { color:var(--err); }
+  .s-SKIPPED { color:var(--skip); }
+  .s-PENDING { color:var(--muted); }
+  .note { font-size:12px; color:var(--muted); margin-top:8px; }
+  .errbox { background:#3a1d22; border:1px solid #6e2b31; color:#ffb3b8;
+            padding:10px 12px; border-radius:6px; margin-top:10px;
+            white-space:pre-wrap; font-size:13px; }
+  .okbox { background:#13301f; border:1px solid #1f5a39; color:#9fe8bd;
+           padding:10px 12px; border-radius:6px; margin-top:10px; font-size:13px; }
+  .auto { display:flex; align-items:center; gap:6px; color:var(--muted);
+          font-size:12px; }
+  .auto input { width:auto; }
+  .muted { color:var(--muted); }
+</style>
+</head>
+<body>
+<header>
+  <h1>束线真空阀组切换控制台</h1>
+  <p>一次提交多阀切换 · 稳定操作标识幂等去重 · 失败逆序补偿 · 重启后服务端状态可对账</p>
+</header>
+
+<main>
+  <section class="panel">
+    <h2>1. 登记阀组与切换意图（2–8 台阀，整数开度 0–100）</h2>
+    <div class="op-row">
+      <div>
+        <label>稳定操作标识 operation_id（重复提交同一标识返回同一结果）</label>
+        <input type="text" id="opId" placeholder="例如 switch-20260926-01">
+      </div>
+      <button class="secondary" id="genBtn" type="button">生成标识</button>
+    </div>
+    <div id="valveRows"></div>
+    <div class="toolbar" style="margin-top:10px">
+      <button class="secondary" id="addBtn" type="button">+ 添加阀门</button>
+      <button class="danger" id="removeBtn" type="button">− 移除末台</button>
+      <span class="muted" id="countNote"></span>
+    </div>
+    <div class="toolbar" style="margin-top:16px">
+      <button id="submitBtn" type="button">提交一次多阀切换</button>
+      <button class="secondary" id="refreshBtn" type="button">刷新服务端状态</button>
+      <label class="auto"><input type="checkbox" id="autoRefresh"> 每 1.5 秒自动刷新</label>
+    </div>
+    <div class="note">
+      模拟设备故障可在部署侧通过 <code>/api/test/failures</code> 注入（需开启
+      <code>VALVE_ALLOW_RESET=1</code>）；设备侧以“操作标识 + 阶段(FORWARD/COMPENSATE)”去重。
+    </div>
+    <div id="formMsg"></div>
+  </section>
+
+  <section class="panel" id="statusPanel" hidden>
+    <h2>2. 服务端确认结果</h2>
+    <div style="display:flex; gap:14px; align-items:center; flex-wrap:wrap">
+      <span class="muted" id="opLabel"></span>
+      <span class="badge" id="phaseBadge"></span>
+      <span id="terminalNote" class="note" style="margin:0"></span>
+      <button class="secondary" id="resumeBtn" type="button" hidden>继续恢复 (resume)</button>
+    </div>
+    <div id="failureBox"></div>
+    <table>
+      <thead>
+        <tr>
+          <th>阀门</th><th>原开度</th><th>目标开度</th>
+          <th>前向动作</th><th>补偿动作</th><th>设备当前开度</th><th>说明</th>
+        </tr>
+      </thead>
+      <tbody id="resultBody"></tbody>
+    </table>
+  </section>
+</main>
+
+<script>
+const MIN_V = 2, MAX_V = 8;
+let valveCount = 3;
+let timer = null;
+
+const $ = (id) => document.getElementById(id);
+
+function renderRows() {
+  const box = $("valveRows");
+  const rows = [...box.querySelectorAll(".row")];
+  while (rows.length < valveCount) {
+    const i = rows.length + 1;
+    const div = document.createElement("div");
+    div.className = "row";
+    div.innerHTML = `
+      <div><label>阀门 ID</label>
+        <input type="text" class="v-id" value="V${String(i).padStart(2,"0")}"></div>
+      <div><label>初始开度</label>
+        <input type="number" class="v-init" min="0" max="100" step="1" value="0"></div>
+      <div><label>目标开度</label>
+        <input type="number" class="v-target" min="0" max="100" step="1" value="50"></div>
+      <div></div>`;
+    box.appendChild(div);
+    rows.push(div);
+  }
+  while (rows.length > valveCount) {
+    rows.pop().remove();
+  }
+  $("countNote").textContent = `当前 ${valveCount} 台（允许 ${MIN_V}–${MAX_V}）`;
+  $("addBtn").disabled = valveCount >= MAX_V;
+  $("removeBtn").disabled = valveCount <= MIN_V;
+}
+
+function collectRequest() {
+  const rows = [...$("valveRows").querySelectorAll(".row")];
+  const valves = rows.map(r => ({
+    valve_id: r.querySelector(".v-id").value.trim(),
+    initial_opening: parseInt(r.querySelector(".v-init").value, 10),
+    target_opening: parseInt(r.querySelector(".v-target").value, 10),
+  }));
+  return { operation_id: $("opId").value.trim(), valves };
+}
+
+function showMsg(el, cls, text) {
+  if (!text) { el.innerHTML = ""; return; }
+  el.innerHTML = `<div class="${cls}">${text.replace(/[<>&]/g, c =>
+    ({"<":"&lt;",">":"&gt;","&":"&amp;"}[c]))}</div>`;
+}
+
+const PHASE_TEXT = {
+  PENDING: "PENDING · 意图已登记",
+  EXECUTING: "EXECUTING · 执行中",
+  COMPLETED: "COMPLETED · 全部完成",
+  COMPENSATING: "COMPENSATING · 逆序补偿中",
+  COMPENSATED: "COMPENSATED · 已全部补偿",
+  COMPENSATION_FAILED: "COMPENSATION_FAILED · 补偿未完成（可继续恢复）",
+};
+
+function renderStatus(s) {
+  $("statusPanel").hidden = false;
+  $("opLabel").textContent = "operation_id: " + s.operation_id;
+  const b = $("phaseBadge");
+  b.className = "badge b-" + s.phase;
+  b.textContent = PHASE_TEXT[s.phase] || s.phase;
+  $("terminalNote").textContent = s.success
+    ? "✔ 所有阀门已到达目标开度"
+    : (s.phase === "COMPENSATED"
+        ? "↩ 切换失败，已成功变更的阀门均按相反顺序恢复原开度"
+        : (s.resumable ? "⏳ 存在可继续的明确状态，可调用 resume / 重复提交同一标识" : ""));
+  $("resumeBtn").hidden = !(s.phase === "COMPENSATION_FAILED" ||
+                            s.phase === "COMPENSATING" || s.phase === "EXECUTING");
+  showMsg($("failureBox"), "errbox",
+    s.failure ? ("故障：" + s.failure +
+      (s.phase === "COMPENSATION_FAILED"
+        ? "\n补偿存在失败动作，状态已保留；排除故障后点击“继续恢复”，不会重复改变已恢复的阀门。" : ""))
+      : "");
+  const body = $("resultBody");
+  body.innerHTML = "";
+  for (const v of s.valves) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td>${v.valve_id}</td>
+      <td>${v.initial_opening}</td>
+      <td>${v.target_opening}</td>
+      <td class="s-${v.forward}">${v.forward}</td>
+      <td class="s-${v.compensate}">${v.compensate}</td>
+      <td>${v.current_opening ?? "—"}</td>
+      <td class="muted">${v.error ? v.error.replace(/[<>&]/g, c =>
+        ({"<":"&lt;",">":"&gt;","&":"&amp;"}[c])) : ""}</td>`;
+    body.appendChild(tr);
+  }
+}
+
+async function submit() {
+  let req;
+  try {
+    req = collectRequest();
+    if (!req.operation_id) throw new Error("请填写稳定操作标识 operation_id");
+    if (req.valves.some(v => !v.valve_id)) throw new Error("每台阀门都需要 ID");
+    if (req.valves.some(v => Number.isNaN(v.initial_opening) ||
+        Number.isNaN(v.target_opening))) throw new Error("开度必须是整数");
+    const ids = new Set(req.valves.map(v => v.valve_id));
+    if (ids.size !== req.valves.length) throw new Error("阀门 ID 不能重复");
+  } catch (e) {
+    showMsg($("formMsg"), "errbox", e.message);
+    return;
+  }
+  $("submitBtn").disabled = true;
+  try {
+    const r = await fetch("/api/switches", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify(req),
+    });
+    const data = await r.json();
+    if (!r.ok) {
+      showMsg($("formMsg"), "errbox",
+        `HTTP ${r.status}：${data.detail ? JSON.stringify(data.detail) : JSON.stringify(data)}`);
+    } else {
+      showMsg($("formMsg"), "okbox",
+        r.status === 201 ? "切换意图已持久化，服务端返回执行结果。"
+                         : "服务端已接受（重复操作标识），返回同一结果。");
+      renderStatus(data);
+    }
+  } catch (e) {
+    showMsg($("formMsg"), "errbox", "请求失败：" + e.message);
+  } finally {
+    $("submitBtn").disabled = false;
+  }
+}
+
+async function refresh() {
+  const op = $("opId").value.trim();
+  if (!op) return;
+  const r = await fetch("/api/switches/" + encodeURIComponent(op));
+  if (r.ok) renderStatus(await r.json());
+}
+
+async function resume() {
+  const op = $("opId").value.trim();
+  const r = await fetch(`/api/switches/${encodeURIComponent(op)}/resume`,
+                        {method: "POST"});
+  if (r.ok) renderStatus(await r.json());
+  else showMsg($("formMsg"), "errbox", `resume 失败 HTTP ${r.status}`);
+}
+
+$("addBtn").onclick = () => { valveCount = Math.min(MAX_V, valveCount + 1); renderRows(); };
+$("removeBtn").onclick = () => { valveCount = Math.max(MIN_V, valveCount - 1); renderRows(); };
+$("submitBtn").onclick = submit;
+$("refreshBtn").onclick = refresh;
+$("resumeBtn").onclick = resume;
+$("genBtn").onclick = () => {
+  $("opId").value = "switch-" + new Date().toISOString().replace(/[-:.TZ]/g, "").slice(0, 14)
+                    + "-" + Math.random().toString(36).slice(2, 7);
+};
+$("autoRefresh").onchange = (e) => {
+  if (timer) { clearInterval(timer); timer = null; }
+  if (e.target.checked) timer = setInterval(refresh, 1500);
+};
+
+renderRows();
+</script>
+</body>
+</html>
