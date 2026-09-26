@@ -31,7 +31,7 @@
     color:var(--text); border-radius:6px; padding:8px 10px; font-size:14px;
   }
   input:focus { outline:none; border-color:var(--accent); }
-  .row { display:grid; grid-template-columns: 2fr 1fr 1fr auto; gap:10px;
+  .row { display:grid; grid-template-columns: 2fr 1fr 1fr 1fr; gap:10px;
          align-items:end; margin-bottom:8px; }
   .op-row { display:grid; grid-template-columns: 1fr auto; gap:10px;
             align-items:end; margin-bottom:16px; }
@@ -55,16 +55,24 @@
   .b-COMPLETED    { background:#14402b; color:#6ee7a8; }
   .b-COMPENSATED  { background:#3d3310; color:#e8cf7a; }
   .b-COMPENSATION_FAILED { background:#4a1d22; color:#ff9ea3; }
+  .b-REVISION_CONFLICT   { background:#3a2a5e; color:#c9b3ff; }
   .s-SUCCESS { color:var(--ok); }
   .s-FAILED  { color:var(--err); }
   .s-SKIPPED { color:var(--skip); }
   .s-PENDING { color:var(--muted); }
+  .s-FENCED  { color:#c9b3ff; }
+  .rev-chip { display:inline-block; min-width:2em; text-align:center;
+              background:#0d1322; border:1px solid var(--line);
+              border-radius:6px; padding:6px 8px; font-size:13px; }
   .note { font-size:12px; color:var(--muted); margin-top:8px; }
   .errbox { background:#3a1d22; border:1px solid #6e2b31; color:#ffb3b8;
             padding:10px 12px; border-radius:6px; margin-top:10px;
             white-space:pre-wrap; font-size:13px; }
   .okbox { background:#13301f; border:1px solid #1f5a39; color:#9fe8bd;
            padding:10px 12px; border-radius:6px; margin-top:10px; font-size:13px; }
+  .fencebox { background:#2a2140; border:1px solid #54408a; color:#d9ccff;
+              padding:10px 12px; border-radius:6px; margin-top:10px;
+              white-space:pre-wrap; font-size:13px; }
   .auto { display:flex; align-items:center; gap:6px; color:var(--muted);
           font-size:12px; }
   .auto input { width:auto; }
@@ -74,10 +82,31 @@
 <body>
 <header>
   <h1>束线真空阀组切换控制台</h1>
-  <p>一次提交多阀切换 · 稳定操作标识幂等去重 · 失败逆序补偿 · 重启后服务端状态可对账</p>
+  <p>一次提交多阀切换 · 稳定操作标识幂等去重 · 失败逆序补偿 · 按修订号条件变更，陈旧快照收敛为修订栅栏冲突</p>
 </header>
 
 <main>
+  <section class="panel">
+    <h2>0. 服务端确认的阀况（开度 + 修订号）</h2>
+    <div class="toolbar">
+      <button class="secondary" id="loadValvesBtn" type="button">读取服务端确认阀况</button>
+      <span class="muted" id="valvesNote">提交切换时会携带下方每台阀门的修订号快照</span>
+    </div>
+    <table>
+      <thead>
+        <tr><th>阀门</th><th>服务端确认开度</th><th>服务端确认修订号</th></tr>
+      </thead>
+      <tbody id="valveStateBody">
+        <tr><td colspan="3" class="muted">尚未读取</td></tr>
+      </tbody>
+    </table>
+    <div class="note">
+      修订号是服务端为每台阀门确认的开度版本：每次前向 / 补偿 / 重启补记动作都是
+      “期望修订号 → 下一修订号”的条件变更。若提交时某阀修订号已被其他已确认切换推进，
+      本切换不会改写现场值，而是稳定收敛为可查询的修订栅栏冲突。
+    </div>
+  </section>
+
   <section class="panel">
     <h2>1. 登记阀组与切换意图（2–8 台阀，整数开度 0–100）</h2>
     <div class="op-row">
@@ -94,11 +123,12 @@
       <span class="muted" id="countNote"></span>
     </div>
     <div class="toolbar" style="margin-top:16px">
-      <button id="submitBtn" type="button">提交一次多阀切换</button>
+      <button id="submitBtn" type="button">提交一次多阀切换（携带修订快照）</button>
       <button class="secondary" id="refreshBtn" type="button">刷新服务端状态</button>
       <label class="auto"><input type="checkbox" id="autoRefresh"> 每 1.5 秒自动刷新</label>
     </div>
     <div class="note">
+      每台阀门的“服务端修订”列显示当前快照；未注册的阀门按修订 0 提交。
       模拟设备故障可在部署侧通过 <code>/api/test/failures</code> 注入（需开启
       <code>VALVE_ALLOW_RESET=1</code>）；设备侧以“操作标识 + 阶段(FORWARD/COMPENSATE)”去重。
     </div>
@@ -114,11 +144,13 @@
       <button class="secondary" id="resumeBtn" type="button" hidden>继续恢复 (resume)</button>
     </div>
     <div id="failureBox"></div>
+    <div id="conflictBox"></div>
     <table>
       <thead>
         <tr>
           <th>阀门</th><th>原开度</th><th>目标开度</th>
-          <th>前向动作</th><th>补偿动作</th><th>设备当前开度</th><th>说明</th>
+          <th>前向动作</th><th>补偿动作</th><th>设备当前开度</th>
+          <th>期望修订</th><th>当前修订</th><th>说明</th>
         </tr>
       </thead>
       <tbody id="resultBody"></tbody>
@@ -130,6 +162,8 @@
 const MIN_V = 2, MAX_V = 8;
 let valveCount = 3;
 let timer = null;
+// Server-confirmed revision snapshot: valve_id -> revision.
+let revisionSnapshot = {};
 
 const $ = (id) => document.getElementById(id);
 
@@ -147,7 +181,8 @@ function renderRows() {
         <input type="number" class="v-init" min="0" max="100" step="1" value="0"></div>
       <div><label>目标开度</label>
         <input type="number" class="v-target" min="0" max="100" step="1" value="50"></div>
-      <div></div>`;
+      <div><label>服务端修订</label>
+        <span class="rev-chip v-rev" title="提交时携带该修订号快照">—</span></div>`;
     box.appendChild(div);
     rows.push(div);
   }
@@ -157,22 +192,41 @@ function renderRows() {
   $("countNote").textContent = `当前 ${valveCount} 台（允许 ${MIN_V}–${MAX_V}）`;
   $("addBtn").disabled = valveCount >= MAX_V;
   $("removeBtn").disabled = valveCount <= MIN_V;
+  paintRowRevisions();
+}
+
+function paintRowRevisions() {
+  for (const r of $("valveRows").querySelectorAll(".row")) {
+    const id = r.querySelector(".v-id").value.trim();
+    const chip = r.querySelector(".v-rev");
+    const rev = revisionSnapshot[id];
+    chip.textContent = rev === undefined ? "0（未注册）" : String(rev);
+  }
 }
 
 function collectRequest() {
   const rows = [...$("valveRows").querySelectorAll(".row")];
-  const valves = rows.map(r => ({
-    valve_id: r.querySelector(".v-id").value.trim(),
-    initial_opening: parseInt(r.querySelector(".v-init").value, 10),
-    target_opening: parseInt(r.querySelector(".v-target").value, 10),
-  }));
+  const valves = rows.map(r => {
+    const id = r.querySelector(".v-id").value.trim();
+    return {
+      valve_id: id,
+      initial_opening: parseInt(r.querySelector(".v-init").value, 10),
+      target_opening: parseInt(r.querySelector(".v-target").value, 10),
+      // Carry the server-confirmed snapshot; unregistered valves start at 0.
+      expected_revision: revisionSnapshot[id] ?? 0,
+    };
+  });
   return { operation_id: $("opId").value.trim(), valves };
+}
+
+function esc(s) {
+  return String(s).replace(/[<>&]/g, c =>
+    ({"<":"&lt;",">":"&gt;","&":"&amp;"}[c]));
 }
 
 function showMsg(el, cls, text) {
   if (!text) { el.innerHTML = ""; return; }
-  el.innerHTML = `<div class="${cls}">${text.replace(/[<>&]/g, c =>
-    ({"<":"&lt;",">":"&gt;","&":"&amp;"}[c]))}</div>`;
+  el.innerHTML = `<div class="${cls}">${esc(text)}</div>`;
 }
 
 const PHASE_TEXT = {
@@ -182,7 +236,22 @@ const PHASE_TEXT = {
   COMPENSATING: "COMPENSATING · 逆序补偿中",
   COMPENSATED: "COMPENSATED · 已全部补偿",
   COMPENSATION_FAILED: "COMPENSATION_FAILED · 补偿未完成（可继续恢复）",
+  REVISION_CONFLICT: "REVISION_CONFLICT · 修订栅栏冲突（现场值未被改写）",
 };
+
+function renderConflict(c) {
+  if (!c) { $("conflictBox").innerHTML = ""; return; }
+  const lines = [
+    `修订栅栏冲突：阀门 ${c.valve_id} 的 ${c.phase} 动作期望修订 ` +
+    `${c.expected_revision}，服务端实际修订 ${c.actual_revision}` +
+    `（已被其他已确认切换推进）。现场值未被改写。`,
+    "未执行动作：",
+    ...c.unexecuted.map(u =>
+      `  · ${u.valve_id} ${u.phase} → 目标开度 ${u.intended_opening}`),
+    "同标识重传只返回本结论；如需继续，请刷新修订号快照后使用新的操作标识。",
+  ];
+  showMsg($("conflictBox"), "fencebox", lines.join("\n"));
+}
 
 function renderStatus(s) {
   $("statusPanel").hidden = false;
@@ -194,7 +263,9 @@ function renderStatus(s) {
     ? "✔ 所有阀门已到达目标开度"
     : (s.phase === "COMPENSATED"
         ? "↩ 切换失败，已成功变更的阀门均按相反顺序恢复原开度"
-        : (s.resumable ? "⏳ 存在可继续的明确状态，可调用 resume / 重复提交同一标识" : ""));
+        : (s.phase === "REVISION_CONFLICT"
+            ? "⛔ 检测到修订栅栏冲突，切换已稳定收敛，未覆盖现场值"
+            : (s.resumable ? "⏳ 存在可继续的明确状态，可调用 resume / 重复提交同一标识" : "")));
   $("resumeBtn").hidden = !(s.phase === "COMPENSATION_FAILED" ||
                             s.phase === "COMPENSATING" || s.phase === "EXECUTING");
   showMsg($("failureBox"), "errbox",
@@ -202,21 +273,47 @@ function renderStatus(s) {
       (s.phase === "COMPENSATION_FAILED"
         ? "\n补偿存在失败动作，状态已保留；排除故障后点击“继续恢复”，不会重复改变已恢复的阀门。" : ""))
       : "");
+  renderConflict(s.conflict);
   const body = $("resultBody");
   body.innerHTML = "";
   for (const v of s.valves) {
     const tr = document.createElement("tr");
     tr.innerHTML = `
-      <td>${v.valve_id}</td>
+      <td>${esc(v.valve_id)}</td>
       <td>${v.initial_opening}</td>
       <td>${v.target_opening}</td>
       <td class="s-${v.forward}">${v.forward}</td>
       <td class="s-${v.compensate}">${v.compensate}</td>
       <td>${v.current_opening ?? "—"}</td>
-      <td class="muted">${v.error ? v.error.replace(/[<>&]/g, c =>
-        ({"<":"&lt;",">":"&gt;","&":"&amp;"}[c])) : ""}</td>`;
+      <td>${v.expected_revision ?? "—"}</td>
+      <td>${v.current_revision ?? "—"}</td>
+      <td class="muted">${v.error ? esc(v.error) : ""}</td>`;
     body.appendChild(tr);
   }
+}
+
+async function loadValves() {
+  try {
+    const r = await fetch("/api/devices/valves");
+    if (!r.ok) return;
+    const valves = await r.json();
+    revisionSnapshot = Object.fromEntries(
+      valves.map(v => [v.valve_id, v.revision]));
+    const body = $("valveStateBody");
+    body.innerHTML = "";
+    if (!valves.length) {
+      body.innerHTML = `<tr><td colspan="3" class="muted">设备尚无注册阀门</td></tr>`;
+    }
+    for (const v of valves) {
+      const tr = document.createElement("tr");
+      tr.innerHTML = `<td>${esc(v.valve_id)}</td><td>${v.opening}</td>` +
+                     `<td><span class="rev-chip">${v.revision}</span></td>`;
+      body.appendChild(tr);
+    }
+    $("valvesNote").textContent =
+      `快照更新时间 ${new Date().toLocaleTimeString()}，提交时逐阀携带`;
+    paintRowRevisions();
+  } catch (e) { /* keep last snapshot */ }
 }
 
 async function submit() {
@@ -247,8 +344,9 @@ async function submit() {
     } else {
       showMsg($("formMsg"), "okbox",
         r.status === 201 ? "切换意图已持久化，服务端返回执行结果。"
-                         : "服务端已接受（重复操作标识），返回同一结果。");
+                         : "服务端已接受（重复操作标识），返回同一结论。");
       renderStatus(data);
+      loadValves();
     }
   } catch (e) {
     showMsg($("formMsg"), "errbox", "请求失败：" + e.message);
@@ -259,16 +357,18 @@ async function submit() {
 
 async function refresh() {
   const op = $("opId").value.trim();
-  if (!op) return;
-  const r = await fetch("/api/switches/" + encodeURIComponent(op));
-  if (r.ok) renderStatus(await r.json());
+  if (op) {
+    const r = await fetch("/api/switches/" + encodeURIComponent(op));
+    if (r.ok) renderStatus(await r.json());
+  }
+  loadValves();
 }
 
 async function resume() {
   const op = $("opId").value.trim();
   const r = await fetch(`/api/switches/${encodeURIComponent(op)}/resume`,
                         {method: "POST"});
-  if (r.ok) renderStatus(await r.json());
+  if (r.ok) { renderStatus(await r.json()); loadValves(); }
   else showMsg($("formMsg"), "errbox", `resume 失败 HTTP ${r.status}`);
 }
 
@@ -277,6 +377,7 @@ $("removeBtn").onclick = () => { valveCount = Math.max(MIN_V, valveCount - 1); r
 $("submitBtn").onclick = submit;
 $("refreshBtn").onclick = refresh;
 $("resumeBtn").onclick = resume;
+$("loadValvesBtn").onclick = loadValves;
 $("genBtn").onclick = () => {
   $("opId").value = "switch-" + new Date().toISOString().replace(/[-:.TZ]/g, "").slice(0, 14)
                     + "-" + Math.random().toString(36).slice(2, 7);
@@ -285,8 +386,13 @@ $("autoRefresh").onchange = (e) => {
   if (timer) { clearInterval(timer); timer = null; }
   if (e.target.checked) timer = setInterval(refresh, 1500);
 };
+// Typing a valve id re-matches it against the revision snapshot.
+$("valveRows").addEventListener("input", (e) => {
+  if (e.target.classList.contains("v-id")) paintRowRevisions();
+});
 
 renderRows();
+loadValves();
 </script>
 </body>
 </html>

@@ -141,9 +141,15 @@ def test_crash_after_forward_device_commit_recognized_on_restart(tmp_path):
             assert [(a["valve_id"], a["opening"]) for a in forward] == [
                 ("V01", 51), ("V02", 52), ("V03", 53), ("V04", 54)
             ]
-            final = {v["valve_id"]: v["opening"]
+            # Each persisted as the conditional change 0 -> 1; the restart
+            # recognized V02's committed change and did NOT advance its
+            # revision a second time.
+            assert [(a["expected_revision"], a["actual_revision"])
+                    for a in forward] == [(0, 1)] * 4
+            final = {v["valve_id"]: (v["opening"], v["revision"])
                      for v in api.get("/api/devices/valves").json()}
-            assert final == {"V01": 51, "V02": 52, "V03": 53, "V04": 54}
+            assert final == {"V01": (51, 1), "V02": (52, 1),
+                             "V03": (53, 1), "V04": (54, 1)}
 
 
 def test_crash_during_compensation_resumes_reverse_rollback(tmp_path):
@@ -178,3 +184,107 @@ def test_crash_during_compensation_resumes_reverse_rollback(tmp_path):
             comp = [(a["valve_id"], a["opening"])
                     for a in acts if a["phase"] == "COMPENSATE"]
             assert comp == [("V02", 2), ("V01", 1)]  # reverse order, once each
+            # Each restoration was the conditional change 1 -> 2 (based on
+            # the revision its own forward receipt recorded).
+            assert [(a["expected_revision"], a["actual_revision"])
+                    for a in acts if a["phase"] == "COMPENSATE"] == [(1, 2)] * 2
+
+
+def test_crash_then_fence_restart_reconciles_and_never_overwrites(tmp_path):
+    """Full fence scenario across a real process crash:
+
+    1. process A dies after the device committed V02's FORWARD (receipt lost)
+    2. process B confirms a DIFFERENT switch that advances V02's revision
+    3. op-x resumes: V02's committed change is recognized from the device
+       log (op id + revision range) and not re-applied; V03's injected
+       reject drives compensation, which fences on V02 instead of reverting
+       the other switch's confirmed opening.
+    """
+    port = _free_port()
+    body = _payload("op-crash-fence")
+
+    # ---- first process: crash right after V02 FORWARD commits on device
+    with server(tmp_path, port,
+                crash_after="op-crash-fence:V02:FORWARD") as proc:
+        _wait_healthy(port)
+        with httpx.Client(base_url=f"http://127.0.0.1:{port}", timeout=5) as api:
+            api.post("/api/test/failures",
+                     json={"forward": ["V03"], "compensate": []})
+            with pytest.raises(httpx.HTTPError):
+                api.post("/api/switches", json=body)
+        assert _wait_dead(proc) == CRASH_EXIT_CODE
+
+    # ---- console restarts: same durable data, no crash marker
+    with server(tmp_path, port) as _:
+        with httpx.Client(base_url=f"http://127.0.0.1:{port}", timeout=5) as api:
+            s0 = api.get("/api/switches/op-crash-fence").json()
+            assert s0["phase"] == "EXECUTING"
+            by_id = {v["valve_id"]: v for v in s0["valves"]}
+            assert by_id["V02"]["forward"] == "PENDING"  # receipt was lost
+
+            # Another console confirms V02 52 -> 70 on top of revision 1.
+            other = {
+                "operation_id": "op-other-console",
+                "valves": [
+                    {"valve_id": "V02", "initial_opening": 52,
+                     "target_opening": 70, "expected_revision": 1},
+                    {"valve_id": "V05", "initial_opening": 5,
+                     "target_opening": 55, "expected_revision": 0},
+                ],
+            }
+            r_other = api.post("/api/switches", json=other)
+            assert r_other.status_code == 201
+            assert r_other.json()["phase"] == "COMPLETED"
+            mid = {v["valve_id"]: (v["opening"], v["revision"])
+                   for v in api.get("/api/devices/valves").json()}
+            assert mid["V02"] == (70, 2)
+
+            # Re-submitting op-x resumes it: V02's committed change is
+            # recognized (not re-driven), V03 rejects (failure persisted in
+            # the device db), and the compensation fences on V02.
+            r = api.post("/api/switches", json=body)
+            assert r.status_code == 200
+            s = r.json()
+            assert s["phase"] == "REVISION_CONFLICT"
+            conflict = s["conflict"]
+            assert conflict["valve_id"] == "V02"
+            assert conflict["phase"] == "COMPENSATE"
+            assert conflict["expected_revision"] == 1
+            assert conflict["actual_revision"] == 2
+            assert [(u["valve_id"], u["phase"])
+                    for u in conflict["unexecuted"]] == [
+                ("V02", "COMPENSATE"), ("V01", "COMPENSATE"),
+            ]
+            by_id = {v["valve_id"]: v for v in s["valves"]}
+            assert by_id["V02"]["forward"] == "SUCCESS"   # recognized receipt
+            assert by_id["V02"]["compensate"] == "FENCED"
+            assert by_id["V03"]["forward"] == "FAILED"
+            assert by_id["V04"]["forward"] == "SKIPPED"
+
+            # The other console's confirmed opening was NOT reverted, and
+            # op-x's resume never advanced V02's revision again.
+            final = {v["valve_id"]: (v["opening"], v["revision"])
+                     for v in api.get("/api/devices/valves").json()}
+            assert final["V02"] == (70, 2)
+            assert final["V01"] == (51, 1)  # restoration never executed
+
+            acts = api.get(
+                "/api/devices/executed-actions",
+                params={"operation_id": "op-crash-fence"},
+            ).json()
+            forward = [a for a in acts if a["phase"] == "FORWARD"]
+            # V02 committed exactly once, as the conditional change 0 -> 1.
+            assert [(a["valve_id"], a["expected_revision"],
+                     a["actual_revision"]) for a in forward] == [
+                ("V01", 0, 1), ("V02", 0, 1),
+            ]
+            assert [a for a in acts if a["phase"] == "COMPENSATE"] == []
+
+            # Same-id retransmission only returns the stored conclusion.
+            again = api.post("/api/switches", json=body)
+            assert again.status_code == 200
+            assert again.json()["phase"] == "REVISION_CONFLICT"
+            assert again.json()["conflict"] == conflict
+            still = {v["valve_id"]: (v["opening"], v["revision"])
+                     for v in api.get("/api/devices/valves").json()}
+            assert still["V02"] == (70, 2)

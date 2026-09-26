@@ -13,13 +13,14 @@ SwitchPhase = Literal[
     "COMPENSATING",   # a failure occurred; rolling back in reverse order
     "COMPENSATED",    # every successfully changed valve restored
     "COMPENSATION_FAILED",  # rollback incomplete; resumable
+    "REVISION_CONFLICT",    # revision fence hit; stable, queryable conclusion
 ]
 
 # Per-action device-side phase, used as the dedupe key component together
 # with the operation id (device dedupes on "op id + phase").
 ActionPhase = Literal["FORWARD", "COMPENSATE"]
 
-ActionResult = Literal["PENDING", "SUCCESS", "FAILED", "SKIPPED"]
+ActionResult = Literal["PENDING", "SUCCESS", "FAILED", "SKIPPED", "FENCED"]
 
 
 class ValveSpec(BaseModel):
@@ -28,6 +29,10 @@ class ValveSpec(BaseModel):
     valve_id: str = Field(..., min_length=1, max_length=64)
     initial_opening: int = Field(..., ge=0, le=100)
     target_opening: int = Field(..., ge=0, le=100)
+    # Revision snapshot shown by the console when the switch was prepared.
+    # Optional: legacy pages omit it and the server snapshots the revisions
+    # at acceptance time instead.
+    expected_revision: Optional[int] = Field(default=None, ge=0)
 
     @field_validator("valve_id")
     @classmethod
@@ -64,6 +69,27 @@ class SwitchRequest(BaseModel):
         return v
 
 
+class UnexecutedAction(BaseModel):
+    """An action the switch never executed because of the revision fence."""
+
+    valve_id: str
+    phase: ActionPhase
+    # Opening the action would have driven to (target for FORWARD, original
+    # opening for COMPENSATE).
+    intended_opening: int
+
+
+class RevisionConflictInfo(BaseModel):
+    """Stable, queryable conclusion of a switch that hit a revision fence."""
+
+    valve_id: str                 # valve whose revision no longer matched
+    phase: ActionPhase            # action kind that detected the fence
+    expected_revision: int        # revision the action was conditioned on
+    actual_revision: int          # revision the device actually holds
+    unexecuted: List[UnexecutedAction]
+    detail: str
+
+
 class ValveResult(BaseModel):
     valve_id: str
     initial_opening: int
@@ -72,6 +98,14 @@ class ValveResult(BaseModel):
     compensate: ActionResult
     current_opening: Optional[int] = None
     error: Optional[str] = None
+    # Revision bookkeeping: the snapshot the forward action was conditioned
+    # on, the revisions the device confirmed in its receipts, and the
+    # revision the device currently holds.
+    expected_revision: Optional[int] = None
+    forward_actual_revision: Optional[int] = None
+    compensate_expected_revision: Optional[int] = None
+    compensate_actual_revision: Optional[int] = None
+    current_revision: Optional[int] = None
 
 
 class SwitchStatus(BaseModel):
@@ -82,3 +116,4 @@ class SwitchStatus(BaseModel):
     resumable: bool
     valves: List[ValveResult]
     failure: Optional[str] = None
+    conflict: Optional[RevisionConflictInfo] = None

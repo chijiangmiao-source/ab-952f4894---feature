@@ -2,8 +2,10 @@
 
 Two tables capture the full saga state:
 
-* ``switches``  - the intent (full request payload) plus current phase.
-* ``actions``   - one row per valve with forward/compensation outcomes.
+* ``switches``  - the intent (full request payload), current phase and, when
+  the switch converged on a revision fence, the queryable conflict record.
+* ``actions``   - one row per valve with forward/compensation outcomes and
+  the expected/actual revisions of every device receipt.
 
 A process-wide lock plus SQLite transactions make each state transition
 atomic; WAL mode lets a verifier read while the service is up.
@@ -25,14 +27,23 @@ class ActionRecord:
     idx: int
     initial_opening: int
     target_opening: int
-    forward_status: str = "PENDING"        # PENDING/SUCCESS/FAILED/SKIPPED
+    # Revision snapshot the forward action is conditioned on (carried by the
+    # submitting page, or taken at acceptance time for legacy requests).
+    expected_revision: int = 0
+    forward_status: str = "PENDING"        # PENDING/SUCCESS/FAILED/SKIPPED/FENCED
     forward_opening: Optional[int] = None
     forward_deduped: bool = False
     forward_error: Optional[str] = None
+    # Revision the device actually recorded for the forward action (receipt).
+    forward_actual_revision: Optional[int] = None
     compensate_status: str = "PENDING"
     compensate_opening: Optional[int] = None
     compensate_deduped: bool = False
     compensate_error: Optional[str] = None
+    # Compensation is conditioned on the revision this switch's own forward
+    # action produced, so it can never revert a third party's later change.
+    compensate_expected_revision: Optional[int] = None
+    compensate_actual_revision: Optional[int] = None
 
 
 @dataclass
@@ -42,6 +53,10 @@ class SwitchRecord:
     failure: Optional[str]
     payload: Dict
     actions: List[ActionRecord] = field(default_factory=list)
+    # Queryable revision-fence conclusion (None unless phase is
+    # REVISION_CONFLICT): fenced valve, expected/actual revisions and the
+    # actions that were never executed.
+    conflict: Optional[Dict] = None
 
 
 class SwitchStore:
@@ -60,6 +75,7 @@ class SwitchStore:
                     phase        TEXT NOT NULL,
                     failure      TEXT,
                     payload      TEXT NOT NULL,
+                    conflict     TEXT,
                     created_at   TEXT NOT NULL DEFAULT (datetime('now')),
                     updated_at   TEXT NOT NULL DEFAULT (datetime('now'))
                 );
@@ -69,18 +85,52 @@ class SwitchStore:
                     valve_id           TEXT NOT NULL,
                     initial_opening    INTEGER NOT NULL,
                     target_opening     INTEGER NOT NULL,
+                    expected_revision  INTEGER NOT NULL DEFAULT 0,
                     forward_status     TEXT NOT NULL DEFAULT 'PENDING',
                     forward_opening    INTEGER,
                     forward_deduped    INTEGER NOT NULL DEFAULT 0,
                     forward_error      TEXT,
+                    forward_actual_revision INTEGER,
                     compensate_status  TEXT NOT NULL DEFAULT 'PENDING',
                     compensate_opening INTEGER,
                     compensate_deduped INTEGER NOT NULL DEFAULT 0,
                     compensate_error   TEXT,
+                    compensate_expected_revision INTEGER,
+                    compensate_actual_revision   INTEGER,
                     PRIMARY KEY (operation_id, valve_id)
                 );
                 """
             )
+            self._migrate()
+
+    def _migrate(self) -> None:
+        """Add revision/conflict columns to databases from older versions."""
+        def columns(table: str) -> set[str]:
+            return {
+                r["name"]
+                for r in self._conn.execute(
+                    f"PRAGMA table_info({table})"
+                ).fetchall()
+            }
+
+        if "conflict" not in columns("switches"):
+            self._conn.execute("ALTER TABLE switches ADD COLUMN conflict TEXT")
+        actions = columns("actions")
+        for col, ddl in (
+            ("expected_revision",
+             "ALTER TABLE actions ADD COLUMN expected_revision "
+             "INTEGER NOT NULL DEFAULT 0"),
+            ("forward_actual_revision",
+             "ALTER TABLE actions ADD COLUMN forward_actual_revision INTEGER"),
+            ("compensate_expected_revision",
+             "ALTER TABLE actions ADD COLUMN compensate_expected_revision "
+             "INTEGER"),
+            ("compensate_actual_revision",
+             "ALTER TABLE actions ADD COLUMN compensate_actual_revision "
+             "INTEGER"),
+        ):
+            if col not in actions:
+                self._conn.execute(ddl)
 
     # ----------------------------------------------------------------- helpers
 
@@ -96,14 +146,18 @@ class SwitchStore:
                     idx=a["idx"],
                     initial_opening=a["initial_opening"],
                     target_opening=a["target_opening"],
+                    expected_revision=a["expected_revision"],
                     forward_status=a["forward_status"],
                     forward_opening=a["forward_opening"],
                     forward_deduped=bool(a["forward_deduped"]),
                     forward_error=a["forward_error"],
+                    forward_actual_revision=a["forward_actual_revision"],
                     compensate_status=a["compensate_status"],
                     compensate_opening=a["compensate_opening"],
                     compensate_deduped=bool(a["compensate_deduped"]),
                     compensate_error=a["compensate_error"],
+                    compensate_expected_revision=a["compensate_expected_revision"],
+                    compensate_actual_revision=a["compensate_actual_revision"],
                 )
             )
         return SwitchRecord(
@@ -112,6 +166,7 @@ class SwitchStore:
             failure=row["failure"],
             payload=json.loads(row["payload"]),
             actions=actions,
+            conflict=json.loads(row["conflict"]) if row["conflict"] else None,
         )
 
     def get(self, operation_id: str) -> Optional[SwitchRecord]:
@@ -145,10 +200,11 @@ class SwitchStore:
             )
             self._conn.executemany(
                 "INSERT INTO actions(operation_id, idx, valve_id, "
-                "initial_opening, target_opening) VALUES(?, ?, ?, ?, ?)",
+                "initial_opening, target_opening, expected_revision) "
+                "VALUES(?, ?, ?, ?, ?, ?)",
                 [
                     (operation_id, a.idx, a.valve_id,
-                     a.initial_opening, a.target_opening)
+                     a.initial_opening, a.target_opening, a.expected_revision)
                     for a in actions
                 ],
             )
@@ -165,14 +221,25 @@ class SwitchStore:
                 (phase, failure, operation_id),
             )
 
+    def set_conflict(self, operation_id: str, conflict: Dict) -> None:
+        """Persist the revision-fence conclusion and converge the switch."""
+        with self._lock, self._conn:
+            self._conn.execute(
+                "UPDATE switches SET phase = 'REVISION_CONFLICT', conflict = ?, "
+                "updated_at = datetime('now') WHERE operation_id = ?",
+                (json.dumps(conflict, sort_keys=True), operation_id),
+            )
+
     def mark_forward(self, operation_id: str, a: ActionRecord) -> None:
         with self._lock, self._conn:
             self._conn.execute(
                 "UPDATE actions SET forward_status = ?, forward_opening = ?, "
-                "forward_deduped = ?, forward_error = ? "
+                "forward_deduped = ?, forward_error = ?, "
+                "forward_actual_revision = ? "
                 "WHERE operation_id = ? AND valve_id = ?",
                 (a.forward_status, a.forward_opening,
                  int(a.forward_deduped), a.forward_error,
+                 a.forward_actual_revision,
                  operation_id, a.valve_id),
             )
             self._conn.execute(
@@ -185,10 +252,12 @@ class SwitchStore:
         with self._lock, self._conn:
             self._conn.execute(
                 "UPDATE actions SET compensate_status = ?, compensate_opening = ?, "
-                "compensate_deduped = ?, compensate_error = ? "
+                "compensate_deduped = ?, compensate_error = ?, "
+                "compensate_expected_revision = ?, compensate_actual_revision = ? "
                 "WHERE operation_id = ? AND valve_id = ?",
                 (a.compensate_status, a.compensate_opening,
                  int(a.compensate_deduped), a.compensate_error,
+                 a.compensate_expected_revision, a.compensate_actual_revision,
                  operation_id, a.valve_id),
             )
             self._conn.execute(

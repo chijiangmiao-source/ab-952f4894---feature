@@ -84,6 +84,8 @@ def get_executed_actions(operation_id: Optional[str] = None) -> list[dict]:
             "valve_id": a.valve_id,
             "phase": a.phase,
             "opening": a.opening,
+            "expected_revision": a.expected_revision,
+            "actual_revision": a.actual_revision,
             "executed_at": a.executed_at,
         }
         for a in devices.executed_actions(operation_id)
@@ -93,7 +95,7 @@ def get_executed_actions(operation_id: Optional[str] = None) -> list[dict]:
 @app.get("/api/devices/valves")
 def get_valves() -> list[dict]:
     return [
-        {"valve_id": v.valve_id, "opening": v.opening}
+        {"valve_id": v.valve_id, "opening": v.opening, "revision": v.revision}
         for v in devices.list_valves()
     ]
 

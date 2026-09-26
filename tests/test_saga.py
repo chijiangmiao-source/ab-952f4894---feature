@@ -132,14 +132,15 @@ def test_device_commit_before_receipt_is_recognized_on_resume(engine):
          for i, v in enumerate(req.valves)],
     )
     devices.execute("op-gap", "V01", claimed_initial=1, new_opening=61,
-                    phase="FORWARD")
+                    phase="FORWARD", expected_revision=0)
     a01 = rec.actions[0]
     a01.forward_status = "SUCCESS"
     a01.forward_opening = 61
+    a01.forward_actual_revision = 1
     store.mark_forward("op-gap", a01)
     # V02 commits on the device ... and no receipt is written.
     devices.execute("op-gap", "V02", claimed_initial=2, new_opening=62,
-                    phase="FORWARD")
+                    phase="FORWARD", expected_revision=0)
 
     # Fresh engine instance, same durable stores == console restart.
     restarted = type(eng)(store, devices)
@@ -149,12 +150,23 @@ def test_device_commit_before_receipt_is_recognized_on_resume(engine):
     persisted = {a.valve_id: a for a in store.get("op-gap").actions}
     assert persisted["V02"].forward_status == "SUCCESS"
     assert persisted["V02"].forward_deduped is True  # recognized, not re-driven
-    # Exactly one FORWARD action per valve on the device.
+    # The re-recorded receipt keeps the revision range the device logged.
+    assert persisted["V02"].expected_revision == 0
+    assert persisted["V02"].forward_actual_revision == 1
+    # Exactly one FORWARD action per valve on the device, each persisted as
+    # the conditional change 0 -> 1; the restart did not advance any
+    # revision a second time.
     forward = [a for a in devices.executed_actions("op-gap")
                if a.phase == "FORWARD"]
     assert [(a.valve_id, a.opening) for a in forward] == [
         ("V01", 61), ("V02", 62), ("V03", 63)
     ]
+    assert [(a.expected_revision, a.actual_revision) for a in forward] == [
+        (0, 1), (0, 1), (0, 1)
+    ]
+    assert {v.valve_id: v.revision for v in devices.list_valves()} == {
+        "V01": 1, "V02": 1, "V03": 1
+    }
 
 
 def test_device_rejects_are_persisted_and_safe_to_retry(engine):

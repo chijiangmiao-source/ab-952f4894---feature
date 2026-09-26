@@ -116,5 +116,95 @@ def test_validation_rejects_bad_count_and_opening(client):
     assert c.post("/api/switches", json=bad_opening).status_code == 422
 
 
-def v2valves(s):
-    return s["valves"]
+def snap_payload(op, specs):
+    """specs: list of (valve_id, initial, target, expected_revision)."""
+    return {
+        "operation_id": op,
+        "valves": [
+            {"valve_id": vid, "initial_opening": init, "target_opening": tgt,
+             "expected_revision": rev}
+            for vid, init, tgt, rev in specs
+        ],
+    }
+
+
+def test_valves_endpoint_exposes_server_confirmed_revisions(client):
+    c, _ = client
+    assert c.post("/api/switches", json=payload("op-rev", n=2)).status_code == 201
+    valves = {v["valve_id"]: v for v in c.get("/api/devices/valves").json()}
+    assert valves["V01"]["revision"] == 1
+    assert valves["V02"]["revision"] == 1
+
+    acts = c.get("/api/devices/executed-actions",
+                 params={"operation_id": "op-rev"}).json()
+    assert [(a["valve_id"], a["expected_revision"], a["actual_revision"])
+            for a in acts] == [("V01", 0, 1), ("V02", 0, 1)]
+
+
+def test_stale_snapshot_rejected_over_http_and_replayable(client):
+    """Two consoles load revision 0; the second submit must fence, not
+    overwrite the first console's confirmed openings."""
+    c, _ = client
+    body = snap_payload("op-http-a", [("V01", 1, 51, 0), ("V02", 2, 52, 0)])
+    assert c.post("/api/switches", json=body).status_code == 201
+
+    stale = snap_payload("op-http-b", [("V01", 1, 70, 0), ("V02", 2, 70, 0)])
+    r = c.post("/api/switches", json=stale)
+    assert r.status_code == 201
+    s = r.json()
+    assert s["phase"] == "REVISION_CONFLICT"
+    assert s["terminal"] and not s["success"] and not s["resumable"]
+    conflict = s["conflict"]
+    assert conflict["valve_id"] == "V01" and conflict["phase"] == "FORWARD"
+    assert conflict["expected_revision"] == 0
+    assert conflict["actual_revision"] == 1
+    assert [(u["valve_id"], u["phase"]) for u in conflict["unexecuted"]] == [
+        ("V01", "FORWARD"), ("V02", "FORWARD"),
+    ]
+    # Nothing on the devices changed for the stale request.
+    cur = {v["valve_id"]: (v["opening"], v["revision"])
+           for v in c.get("/api/devices/valves").json()}
+    assert cur == {"V01": (51, 1), "V02": (52, 1)}
+    assert c.get("/api/devices/executed-actions",
+                 params={"operation_id": "op-http-b"}).json() == []
+
+    # Same-id retransmission returns the original conclusion (200).
+    r2 = c.post("/api/switches", json=stale)
+    assert r2.status_code == 200
+    assert r2.json()["phase"] == "REVISION_CONFLICT"
+    assert r2.json()["conflict"] == conflict
+
+    # The conclusion is queryable afterwards.
+    g = c.get("/api/switches/op-http-b").json()
+    assert g["phase"] == "REVISION_CONFLICT"
+    assert g["conflict"]["valve_id"] == "V01"
+
+
+def test_compensation_fence_over_http(client):
+    """An earlier switch's late compensation must not revert the opening a
+    newer switch already confirmed; it converges to REVISION_CONFLICT."""
+    c, _ = client
+    c.post("/api/test/failures",
+           json={"forward": ["V03"], "compensate": ["V02"]})
+    s1 = c.post("/api/switches", json=payload("op-http-s1", n=3)).json()
+    assert s1["phase"] == "COMPENSATION_FAILED"
+
+    # Other console confirms V01 51 -> 80 on top of revision 1.
+    s2 = snap_payload("op-http-s2", [("V01", 51, 80, 1), ("V09", 9, 19, 0)])
+    assert c.post("/api/switches", json=s2).json()["phase"] == "COMPLETED"
+
+    c.post("/api/test/failures", json={"forward": ["V03"], "compensate": []})
+    r = c.post("/api/switches/op-http-s1/resume")
+    s = r.json()
+    assert s["phase"] == "REVISION_CONFLICT"
+    assert s["conflict"]["valve_id"] == "V01"
+    assert s["conflict"]["phase"] == "COMPENSATE"
+    assert s["conflict"]["expected_revision"] == 1
+    assert s["conflict"]["actual_revision"] == 2
+    assert [(u["valve_id"], u["phase"]) for u in s["conflict"]["unexecuted"]] == [
+        ("V01", "COMPENSATE"),
+    ]
+    # The confirmed opening stands; V02 was restored (its revision matched).
+    cur = {v["valve_id"]: v["opening"]
+           for v in c.get("/api/devices/valves").json()}
+    assert cur["V01"] == 80 and cur["V02"] == 2
