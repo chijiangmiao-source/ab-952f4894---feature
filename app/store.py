@@ -3,7 +3,9 @@
 Two tables capture the full saga state:
 
 * ``switches``  - the intent (full request payload) plus current phase.
-* ``actions``   - one row per valve with forward/compensation outcomes.
+* ``actions``   - one row per valve with forward/compensation outcomes,
+  including the expected/actual revision of every conditional device
+  change (the receipt the saga reconciles against after a restart).
 
 A process-wide lock plus SQLite transactions make each state transition
 atomic; WAL mode lets a verifier read while the service is up.
@@ -25,14 +27,18 @@ class ActionRecord:
     idx: int
     initial_opening: int
     target_opening: int
-    forward_status: str = "PENDING"        # PENDING/SUCCESS/FAILED/SKIPPED
+    forward_status: str = "PENDING"        # PENDING/SUCCESS/FAILED/SKIPPED/FENCED
     forward_opening: Optional[int] = None
     forward_deduped: bool = False
     forward_error: Optional[str] = None
+    forward_expected_revision: Optional[int] = None
+    forward_actual_revision: Optional[int] = None
     compensate_status: str = "PENDING"
     compensate_opening: Optional[int] = None
     compensate_deduped: bool = False
     compensate_error: Optional[str] = None
+    compensate_expected_revision: Optional[int] = None
+    compensate_actual_revision: Optional[int] = None
 
 
 @dataclass
@@ -73,14 +79,29 @@ class SwitchStore:
                     forward_opening    INTEGER,
                     forward_deduped    INTEGER NOT NULL DEFAULT 0,
                     forward_error      TEXT,
+                    forward_expected_revision INTEGER,
+                    forward_actual_revision   INTEGER,
                     compensate_status  TEXT NOT NULL DEFAULT 'PENDING',
                     compensate_opening INTEGER,
                     compensate_deduped INTEGER NOT NULL DEFAULT 0,
                     compensate_error   TEXT,
+                    compensate_expected_revision INTEGER,
+                    compensate_actual_revision   INTEGER,
                     PRIMARY KEY (operation_id, valve_id)
                 );
                 """
             )
+            self._migrate()
+
+    def _migrate(self) -> None:
+        """Add revision columns to databases created by older versions."""
+        cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(actions)")}
+        for col in (
+            "forward_expected_revision", "forward_actual_revision",
+            "compensate_expected_revision", "compensate_actual_revision",
+        ):
+            if col not in cols:
+                self._conn.execute(f"ALTER TABLE actions ADD COLUMN {col} INTEGER")
 
     # ----------------------------------------------------------------- helpers
 
@@ -100,10 +121,14 @@ class SwitchStore:
                     forward_opening=a["forward_opening"],
                     forward_deduped=bool(a["forward_deduped"]),
                     forward_error=a["forward_error"],
+                    forward_expected_revision=a["forward_expected_revision"],
+                    forward_actual_revision=a["forward_actual_revision"],
                     compensate_status=a["compensate_status"],
                     compensate_opening=a["compensate_opening"],
                     compensate_deduped=bool(a["compensate_deduped"]),
                     compensate_error=a["compensate_error"],
+                    compensate_expected_revision=a["compensate_expected_revision"],
+                    compensate_actual_revision=a["compensate_actual_revision"],
                 )
             )
         return SwitchRecord(
@@ -145,10 +170,12 @@ class SwitchStore:
             )
             self._conn.executemany(
                 "INSERT INTO actions(operation_id, idx, valve_id, "
-                "initial_opening, target_opening) VALUES(?, ?, ?, ?, ?)",
+                "initial_opening, target_opening, forward_expected_revision) "
+                "VALUES(?, ?, ?, ?, ?, ?)",
                 [
                     (operation_id, a.idx, a.valve_id,
-                     a.initial_opening, a.target_opening)
+                     a.initial_opening, a.target_opening,
+                     a.forward_expected_revision)
                     for a in actions
                 ],
             )
@@ -169,10 +196,12 @@ class SwitchStore:
         with self._lock, self._conn:
             self._conn.execute(
                 "UPDATE actions SET forward_status = ?, forward_opening = ?, "
-                "forward_deduped = ?, forward_error = ? "
+                "forward_deduped = ?, forward_error = ?, "
+                "forward_expected_revision = ?, forward_actual_revision = ? "
                 "WHERE operation_id = ? AND valve_id = ?",
                 (a.forward_status, a.forward_opening,
                  int(a.forward_deduped), a.forward_error,
+                 a.forward_expected_revision, a.forward_actual_revision,
                  operation_id, a.valve_id),
             )
             self._conn.execute(
@@ -185,10 +214,12 @@ class SwitchStore:
         with self._lock, self._conn:
             self._conn.execute(
                 "UPDATE actions SET compensate_status = ?, compensate_opening = ?, "
-                "compensate_deduped = ?, compensate_error = ? "
+                "compensate_deduped = ?, compensate_error = ?, "
+                "compensate_expected_revision = ?, compensate_actual_revision = ? "
                 "WHERE operation_id = ? AND valve_id = ?",
                 (a.compensate_status, a.compensate_opening,
                  int(a.compensate_deduped), a.compensate_error,
+                 a.compensate_expected_revision, a.compensate_actual_revision,
                  operation_id, a.valve_id),
             )
             self._conn.execute(

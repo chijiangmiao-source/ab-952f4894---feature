@@ -4,8 +4,9 @@ The server process is killed with ``os._exit(77)`` at the precise instant
 *after* the simulated device committed an action but *before* the
 application stored its receipt (controlled by ``CRASH_AFTER``). A brand new
 process is then started against the same data directory and must recognize
-the executed action through the device dedupe log instead of moving the
-valve twice.
+the executed action through the device dedupe log — by operation id and
+revision interval — instead of moving the valve twice or advancing the
+revision a second time.
 """
 from __future__ import annotations
 
@@ -115,6 +116,10 @@ def test_crash_after_forward_device_commit_recognized_on_restart(tmp_path):
     # ---- console restarts: no crash marker, same durable data
     with server(tmp_path, port) as _:
         with httpx.Client(base_url=f"http://127.0.0.1:{port}", timeout=5) as api:
+            # The console page is served again after the crash.
+            page = api.get("/")
+            assert page.status_code == 200 and "修订号" in page.text
+
             mid = api.get("/api/switches/op-crash-forward")
             assert mid.status_code == 200
             s0 = mid.json()
@@ -131,6 +136,9 @@ def test_crash_after_forward_device_commit_recognized_on_restart(tmp_path):
             by_id = {v["valve_id"]: v for v in s["valves"]}
             # V02 was recognized on the device, not driven a second time.
             assert by_id["V02"]["forward"] == "SUCCESS"
+            assert by_id["V02"]["forward_deduped"] is True
+            assert by_id["V02"]["forward_expected_revision"] == 0
+            assert by_id["V02"]["forward_actual_revision"] == 1
 
             acts = api.get(
                 "/api/devices/executed-actions",
@@ -141,9 +149,16 @@ def test_crash_after_forward_device_commit_recognized_on_restart(tmp_path):
             assert [(a["valve_id"], a["opening"]) for a in forward] == [
                 ("V01", 51), ("V02", 52), ("V03", 53), ("V04", 54)
             ]
-            final = {v["valve_id"]: v["opening"]
+            # Every conditional change recorded its revision interval 0 -> 1
+            # and the recognized action did NOT advance the revision again.
+            assert [(a["expected_revision"], a["actual_revision"])
+                    for a in forward] == [(0, 1)] * 4
+            final = {v["valve_id"]: (v["opening"], v["revision"])
                      for v in api.get("/api/devices/valves").json()}
-            assert final == {"V01": 51, "V02": 52, "V03": 53, "V04": 54}
+            assert final == {
+                "V01": (51, 1), "V02": (52, 1),
+                "V03": (53, 1), "V04": (54, 1),
+            }
 
 
 def test_crash_during_compensation_resumes_reverse_rollback(tmp_path):
@@ -178,3 +193,12 @@ def test_crash_during_compensation_resumes_reverse_rollback(tmp_path):
             comp = [(a["valve_id"], a["opening"])
                     for a in acts if a["phase"] == "COMPENSATE"]
             assert comp == [("V02", 2), ("V01", 1)]  # reverse order, once each
+            # The recognized compensation kept its original revision
+            # interval instead of being re-driven.
+            comp_rev = [(a["valve_id"], a["expected_revision"],
+                         a["actual_revision"])
+                        for a in acts if a["phase"] == "COMPENSATE"]
+            assert comp_rev == [("V02", 1, 2), ("V01", 1, 2)]
+            final = {v["valve_id"]: v["revision"]
+                     for v in api.get("/api/devices/valves").json()}
+            assert final == {"V01": 2, "V02": 2, "V03": 0}

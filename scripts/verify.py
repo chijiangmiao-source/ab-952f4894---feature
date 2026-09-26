@@ -3,9 +3,12 @@
 
 Runs, in order:
   1. build check        - byte-compile all sources and import the app
-  2. code tests         - pytest (reverse-order compensation and
-                          post-restart receipt recognition included)
-  3. HTTP smoke         - live checks against the ``web`` service
+  2. code tests         - pytest (reverse-order compensation, revision
+                          fences, stale-snapshot rejection and post-restart
+                          receipt reconciliation included)
+  3. HTTP smoke         - live checks against the ``web`` service,
+                          including stale-snapshot rejection, compensation
+                          hitting the revision fence, and the console page
 
 The process exits non-zero (and reports the code) as soon as any stage
 fails; exits 0 only when every stage passes.
@@ -68,7 +71,8 @@ def main() -> int:
         return rc
 
     # 2. code tests ----------------------------------------------------------
-    rc = run("code tests (pytest: reverse compensation + restart receipts)",
+    rc = run("code tests (pytest: reverse compensation, revision fences, "
+             "restart receipt reconciliation)",
              [sys.executable, "-m", "pytest", "-q", "--tb=short", "tests"])
     if rc:
         return rc
@@ -77,7 +81,8 @@ def main() -> int:
     if not wait_for_web():
         print("!!! web service did not become healthy", flush=True)
         return 1
-    rc = run("HTTP smoke", [sys.executable, "scripts/smoke.py", WEB_URL])
+    rc = run("HTTP smoke (stale snapshot fence + compensation fence + page)",
+             [sys.executable, "scripts/smoke.py", WEB_URL])
     if rc:
         return rc
 

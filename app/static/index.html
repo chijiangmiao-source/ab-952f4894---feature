@@ -19,7 +19,7 @@
   header { padding:20px 28px; border-bottom:1px solid var(--line); }
   header h1 { margin:0; font-size:18px; }
   header p { margin:4px 0 0; color:var(--muted); font-size:12px; }
-  main { max-width:1040px; margin:24px auto; padding:0 20px; }
+  main { max-width:1120px; margin:24px auto; padding:0 20px; }
   .panel {
     background:var(--panel); border:1px solid var(--line);
     border-radius:10px; padding:20px; margin-bottom:20px;
@@ -31,7 +31,7 @@
     color:var(--text); border-radius:6px; padding:8px 10px; font-size:14px;
   }
   input:focus { outline:none; border-color:var(--accent); }
-  .row { display:grid; grid-template-columns: 2fr 1fr 1fr auto; gap:10px;
+  .row { display:grid; grid-template-columns: 2fr 1fr 1fr 1.4fr; gap:10px;
          align-items:end; margin-bottom:8px; }
   .op-row { display:grid; grid-template-columns: 1fr auto; gap:10px;
             align-items:end; margin-bottom:16px; }
@@ -55,16 +55,30 @@
   .b-COMPLETED    { background:#14402b; color:#6ee7a8; }
   .b-COMPENSATED  { background:#3d3310; color:#e8cf7a; }
   .b-COMPENSATION_FAILED { background:#4a1d22; color:#ff9ea3; }
+  .b-REVISION_CONFLICT   { background:#3a2a12; color:#ffc46b; }
   .s-SUCCESS { color:var(--ok); }
   .s-FAILED  { color:var(--err); }
   .s-SKIPPED { color:var(--skip); }
   .s-PENDING { color:var(--muted); }
+  .s-FENCED  { color:var(--warn); font-weight:600; }
+  .rev-chip {
+    display:inline-block; min-width:2em; text-align:center;
+    background:#0d1322; border:1px solid var(--line); border-radius:6px;
+    padding:2px 8px; font-size:12px; color:#9fc1ff;
+  }
+  .rev-label { font-size:12px; color:var(--muted); }
   .note { font-size:12px; color:var(--muted); margin-top:8px; }
   .errbox { background:#3a1d22; border:1px solid #6e2b31; color:#ffb3b8;
             padding:10px 12px; border-radius:6px; margin-top:10px;
             white-space:pre-wrap; font-size:13px; }
   .okbox { background:#13301f; border:1px solid #1f5a39; color:#9fe8bd;
            padding:10px 12px; border-radius:6px; margin-top:10px; font-size:13px; }
+  .fencebox { background:#33270f; border:1px solid #6b511c; color:#ffd98a;
+              padding:12px 14px; border-radius:6px; margin-top:10px;
+              font-size:13px; }
+  .fencebox h3 { margin:0 0 8px; font-size:13px; color:#ffc46b; }
+  .fencebox table { margin-top:4px; }
+  .fencebox th, .fencebox td { border-bottom:1px solid #4a3a17; padding:6px 10px 6px 0; }
   .auto { display:flex; align-items:center; gap:6px; color:var(--muted);
           font-size:12px; }
   .auto input { width:auto; }
@@ -74,7 +88,7 @@
 <body>
 <header>
   <h1>束线真空阀组切换控制台</h1>
-  <p>一次提交多阀切换 · 稳定操作标识幂等去重 · 失败逆序补偿 · 重启后服务端状态可对账</p>
+  <p>一次提交多阀切换 · 稳定操作标识幂等去重 · 失败逆序补偿 · 按修订号快照做条件变更，陈旧快照绝不覆盖他人已确认开度</p>
 </header>
 
 <main>
@@ -87,6 +101,10 @@
       </div>
       <button class="secondary" id="genBtn" type="button">生成标识</button>
     </div>
+    <div class="row" style="margin-bottom:2px">
+      <div></div><div></div><div></div>
+      <div class="rev-label">服务端确认修订号（提交时随快照携带）</div>
+    </div>
     <div id="valveRows"></div>
     <div class="toolbar" style="margin-top:10px">
       <button class="secondary" id="addBtn" type="button">+ 添加阀门</button>
@@ -96,9 +114,12 @@
     <div class="toolbar" style="margin-top:16px">
       <button id="submitBtn" type="button">提交一次多阀切换</button>
       <button class="secondary" id="refreshBtn" type="button">刷新服务端状态</button>
+      <button class="secondary" id="revBtn" type="button">刷新设备修订号</button>
       <label class="auto"><input type="checkbox" id="autoRefresh"> 每 1.5 秒自动刷新</label>
     </div>
     <div class="note">
+      每台阀门的开度变更都是“期望修订号 → 下一修订号”的条件变更：若修订号已被另一份已确认切换推进，
+      本切换不会覆盖现场值，而是收敛为可查询的修订栅栏冲突（REVISION_CONFLICT）。
       模拟设备故障可在部署侧通过 <code>/api/test/failures</code> 注入（需开启
       <code>VALVE_ALLOW_RESET=1</code>）；设备侧以“操作标识 + 阶段(FORWARD/COMPENSATE)”去重。
     </div>
@@ -114,11 +135,14 @@
       <button class="secondary" id="resumeBtn" type="button" hidden>继续恢复 (resume)</button>
     </div>
     <div id="failureBox"></div>
+    <div id="fenceBox"></div>
     <table>
       <thead>
         <tr>
           <th>阀门</th><th>原开度</th><th>目标开度</th>
-          <th>前向动作</th><th>补偿动作</th><th>设备当前开度</th><th>说明</th>
+          <th>前向动作</th><th>前向修订(期望→实际)</th>
+          <th>补偿动作</th><th>补偿修订(期望→实际)</th>
+          <th>设备当前开度</th><th>当前修订</th><th>说明</th>
         </tr>
       </thead>
       <tbody id="resultBody"></tbody>
@@ -130,16 +154,20 @@
 const MIN_V = 2, MAX_V = 8;
 let valveCount = 3;
 let timer = null;
+// Server-confirmed device snapshot: valve_id -> {opening, revision}.
+let revisionMap = {};
 
 const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s).replace(/[<>&]/g, c =>
+  ({"<":"&lt;",">":"&gt;","&":"&amp;"}[c]));
 
 function renderRows() {
   const box = $("valveRows");
-  const rows = [...box.querySelectorAll(".row")];
+  const rows = [...box.querySelectorAll(".row.data-row")];
   while (rows.length < valveCount) {
     const i = rows.length + 1;
     const div = document.createElement("div");
-    div.className = "row";
+    div.className = "row data-row";
     div.innerHTML = `
       <div><label>阀门 ID</label>
         <input type="text" class="v-id" value="V${String(i).padStart(2,"0")}"></div>
@@ -147,9 +175,10 @@ function renderRows() {
         <input type="number" class="v-init" min="0" max="100" step="1" value="0"></div>
       <div><label>目标开度</label>
         <input type="number" class="v-target" min="0" max="100" step="1" value="50"></div>
-      <div></div>`;
+      <div class="rev-cell"></div>`;
     box.appendChild(div);
     rows.push(div);
+    div.querySelector(".v-id").addEventListener("input", () => updateRevCell(div));
   }
   while (rows.length > valveCount) {
     rows.pop().remove();
@@ -157,22 +186,56 @@ function renderRows() {
   $("countNote").textContent = `当前 ${valveCount} 台（允许 ${MIN_V}–${MAX_V}）`;
   $("addBtn").disabled = valveCount >= MAX_V;
   $("removeBtn").disabled = valveCount <= MIN_V;
+  refreshRevCells();
+}
+
+function updateRevCell(row) {
+  const id = row.querySelector(".v-id").value.trim();
+  const cell = row.querySelector(".rev-cell");
+  const known = Object.prototype.hasOwnProperty.call(revisionMap, id) && id;
+  const rev = known ? revisionMap[id].revision : 0;
+  const opening = known ? revisionMap[id].opening : null;
+  cell.innerHTML = known
+    ? `<span class="rev-chip" data-rev="${rev}">r${rev}</span> ` +
+      `<span class="rev-label">当前开度 ${opening}</span>`
+    : `<span class="rev-chip" data-rev="0">r0</span> ` +
+      `<span class="rev-label">设备尚无记录，按 r0 快照</span>`;
+}
+
+function refreshRevCells() {
+  [...$("valveRows").querySelectorAll(".row.data-row")].forEach(updateRevCell);
+}
+
+async function refreshRevisions() {
+  try {
+    const r = await fetch("/api/devices/valves");
+    if (!r.ok) return;
+    const valves = await r.json();
+    revisionMap = {};
+    for (const v of valves) revisionMap[v.valve_id] = v;
+    refreshRevCells();
+  } catch (e) { /* keep last known snapshot */ }
 }
 
 function collectRequest() {
-  const rows = [...$("valveRows").querySelectorAll(".row")];
+  const rows = [...$("valveRows").querySelectorAll(".row.data-row")];
   const valves = rows.map(r => ({
     valve_id: r.querySelector(".v-id").value.trim(),
     initial_opening: parseInt(r.querySelector(".v-init").value, 10),
     target_opening: parseInt(r.querySelector(".v-target").value, 10),
   }));
-  return { operation_id: $("opId").value.trim(), valves };
+  // Carry the displayed server-confirmed revision snapshot with the submit.
+  const revisions = {};
+  for (const v of valves) {
+    revisions[v.valve_id] = Object.prototype.hasOwnProperty.call(revisionMap, v.valve_id)
+      ? revisionMap[v.valve_id].revision : 0;
+  }
+  return { operation_id: $("opId").value.trim(), valves, revisions };
 }
 
 function showMsg(el, cls, text) {
   if (!text) { el.innerHTML = ""; return; }
-  el.innerHTML = `<div class="${cls}">${text.replace(/[<>&]/g, c =>
-    ({"<":"&lt;",">":"&gt;","&":"&amp;"}[c]))}</div>`;
+  el.innerHTML = `<div class="${cls}">${esc(text)}</div>`;
 }
 
 const PHASE_TEXT = {
@@ -182,7 +245,35 @@ const PHASE_TEXT = {
   COMPENSATING: "COMPENSATING · 逆序补偿中",
   COMPENSATED: "COMPENSATED · 已全部补偿",
   COMPENSATION_FAILED: "COMPENSATION_FAILED · 补偿未完成（可继续恢复）",
+  REVISION_CONFLICT: "REVISION_CONFLICT · 修订栅栏冲突（未覆盖现场值）",
 };
+
+const revPair = (exp, act) =>
+  (exp === null || exp === undefined) ? "—" : `${exp} → ${act === null || act === undefined ? "?" : act}`;
+
+function renderConflicts(s) {
+  const box = $("fenceBox");
+  if (!s.conflicts || s.conflicts.length === 0) { box.innerHTML = ""; return; }
+  const rows = s.conflicts.map(c => `
+    <tr><td>${esc(c.valve_id)}</td><td>${esc(c.phase)}</td>
+        <td>${c.expected_revision}</td><td>${c.actual_revision}</td></tr>`).join("");
+  const unex = (s.unexecuted && s.unexecuted.length)
+    ? `<h3>未执行动作</h3><table><thead>
+         <tr><th>阀门</th><th>动作</th><th>说明</th></tr></thead>
+         <tbody>${s.unexecuted.map(u =>
+           `<tr><td>${esc(u.valve_id)}</td><td>${esc(u.phase)}</td>
+                <td>${esc(u.reason)}</td></tr>`).join("")}</tbody></table>`
+    : "";
+  box.innerHTML = `<div class="fencebox">
+    <h3>⚠ 修订栅栏冲突：以下阀门的修订号已被另一份已确认切换推进，本切换未覆盖现场值</h3>
+    <table><thead>
+      <tr><th>阀门</th><th>动作</th><th>期望修订</th><th>实际修订</th></tr>
+    </thead><tbody>${rows}</tbody></table>
+    ${unex}
+    <div class="note">排除快照差异后，请用新的 operation_id 基于最新修订号重新提交；
+    同一标识重传只会返回本结论。</div>
+  </div>`;
+}
 
 function renderStatus(s) {
   $("statusPanel").hidden = false;
@@ -194,7 +285,9 @@ function renderStatus(s) {
     ? "✔ 所有阀门已到达目标开度"
     : (s.phase === "COMPENSATED"
         ? "↩ 切换失败，已成功变更的阀门均按相反顺序恢复原开度"
-        : (s.resumable ? "⏳ 存在可继续的明确状态，可调用 resume / 重复提交同一标识" : ""));
+        : (s.phase === "REVISION_CONFLICT"
+            ? "⛔ 修订已被其他已确认切换推进，现场值未被覆盖"
+            : (s.resumable ? "⏳ 存在可继续的明确状态，可调用 resume / 重复提交同一标识" : "")));
   $("resumeBtn").hidden = !(s.phase === "COMPENSATION_FAILED" ||
                             s.phase === "COMPENSATING" || s.phase === "EXECUTING");
   showMsg($("failureBox"), "errbox",
@@ -202,21 +295,36 @@ function renderStatus(s) {
       (s.phase === "COMPENSATION_FAILED"
         ? "\n补偿存在失败动作，状态已保留；排除故障后点击“继续恢复”，不会重复改变已恢复的阀门。" : ""))
       : "");
+  renderConflicts(s);
   const body = $("resultBody");
   body.innerHTML = "";
   for (const v of s.valves) {
     const tr = document.createElement("tr");
     tr.innerHTML = `
-      <td>${v.valve_id}</td>
+      <td>${esc(v.valve_id)}</td>
       <td>${v.initial_opening}</td>
       <td>${v.target_opening}</td>
-      <td class="s-${v.forward}">${v.forward}</td>
-      <td class="s-${v.compensate}">${v.compensate}</td>
+      <td class="s-${v.forward}">${v.forward}${v.forward_deduped ? "·去重" : ""}</td>
+      <td>${revPair(v.forward_expected_revision, v.forward_actual_revision)}</td>
+      <td class="s-${v.compensate}">${v.compensate}${v.compensate_deduped ? "·去重" : ""}</td>
+      <td>${revPair(v.compensate_expected_revision, v.compensate_actual_revision)}</td>
       <td>${v.current_opening ?? "—"}</td>
-      <td class="muted">${v.error ? v.error.replace(/[<>&]/g, c =>
-        ({"<":"&lt;",">":"&gt;","&":"&amp;"}[c])) : ""}</td>`;
+      <td>${v.current_revision === null || v.current_revision === undefined
+             ? "—" : "r" + v.current_revision}</td>
+      <td class="muted">${v.error ? esc(v.error) : ""}</td>`;
     body.appendChild(tr);
   }
+  // Fold the server-confirmed revisions back into the submit snapshot.
+  let changed = false;
+  for (const v of s.valves) {
+    if (v.current_revision !== null && v.current_revision !== undefined) {
+      revisionMap[v.valve_id] = {
+        opening: v.current_opening, revision: v.current_revision,
+      };
+      changed = true;
+    }
+  }
+  if (changed) refreshRevCells();
 }
 
 async function submit() {
@@ -259,6 +367,7 @@ async function submit() {
 
 async function refresh() {
   const op = $("opId").value.trim();
+  await refreshRevisions();
   if (!op) return;
   const r = await fetch("/api/switches/" + encodeURIComponent(op));
   if (r.ok) renderStatus(await r.json());
@@ -276,6 +385,7 @@ $("addBtn").onclick = () => { valveCount = Math.min(MAX_V, valveCount + 1); rend
 $("removeBtn").onclick = () => { valveCount = Math.max(MIN_V, valveCount - 1); renderRows(); };
 $("submitBtn").onclick = submit;
 $("refreshBtn").onclick = refresh;
+$("revBtn").onclick = refreshRevisions;
 $("resumeBtn").onclick = resume;
 $("genBtn").onclick = () => {
   $("opId").value = "switch-" + new Date().toISOString().replace(/[-:.TZ]/g, "").slice(0, 14)
@@ -287,6 +397,7 @@ $("autoRefresh").onchange = (e) => {
 };
 
 renderRows();
+refreshRevisions();
 </script>
 </body>
 </html>

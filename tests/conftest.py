@@ -24,7 +24,8 @@ def engine(tmp_path):
 
 
 def make_request(op: str = "op-1", n: int = 4,
-                 initial: int = 0, target: int = 60) -> SwitchRequest:
+                 initial: int = 0, target: int = 60,
+                 revisions: dict | None = None) -> SwitchRequest:
     return SwitchRequest(
         operation_id=op,
         valves=[
@@ -35,4 +36,5 @@ def make_request(op: str = "op-1", n: int = 4,
             )
             for i in range(1, n + 1)
         ],
+        revisions=revisions,
     )
